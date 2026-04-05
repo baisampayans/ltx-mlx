@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.eggs/
+*.mp4
+!samples/*.mp4
+# Model weight directories (not source code)
+/models/
+output_*.mp4
+.DS_Store
