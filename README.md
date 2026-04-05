@@ -6,14 +6,21 @@ Supports **LTX-Video 2B** (fast) and **LTX-Video 13B** (high quality) with autom
 
 ## Performance
 
-| Model | Resolution | Frames | Steps | Time | Notes |
-|-------|-----------|--------|-------|------|-------|
-| 2B | 480x768 | 97 | 4 | **~7s** | Fast preview |
-| 13B | 480x768 | 97 | 8 | **~56s** | Good quality |
-| 13B | 720x1280 | 41 | 8 | **~65s** | Sharp, cinematic |
-| 13B | 1080x1920 | 17 | 8 | **~78s** | Maximum detail |
+| Model | Resolution | Frames | Steps | ltx-mlx | PyTorch MPS | Speedup |
+|-------|-----------|--------|-------|---------|-------------|---------|
+| 2B | 480x768 | 97 | 4 | **~7s** | ~26s | **3.4x** |
+| 2B | 1080x1920 | 17 | 4 | **~9s** | ~30s | **3.3x** |
+| 13B | 480x768 | 97 | 8 | **~56s** | ~90s | **1.6x** |
+| 13B | 720x1280 | 41 | 8 | **~65s** | ~120s | **1.8x** |
+| 13B | 1080x1920 | 17 | 8 | **~78s** | ~140s | **1.8x** |
 
-Benchmarked on M3 Ultra (76 GPU cores, 256 GB). Times include T5 encoding + DiT denoising + VAE decode.
+| | PyTorch | ltx-mlx |
+|---|---|---|
+| **Model loading** | 30-45s | **1-2s** |
+| **Install size** | ~8 GB (torch, diffusers, transformers, ...) | **~200 MB** (mlx, numpy, sentencepiece) |
+| **Dependencies** | 30+ packages | **5 packages** |
+
+Benchmarked on M3 Ultra (76 GPU cores, 256 GB). PyTorch numbers use optimized MPS pipeline with bf16 + patched SDPA.
 
 ## Install
 
