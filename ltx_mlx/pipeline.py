@@ -25,7 +25,7 @@ import numpy as np
 
 from ltx_mlx.models.text_encoder import T5Encoder, T5Tokenizer, load_t5_encoder
 from ltx_mlx.models.transformer import LTXVideoTransformer, compute_rope, load_transformer
-from ltx_mlx.models.vae import LTXVideoDecoder, load_vae_decoder
+from ltx_mlx.models.vae import LTXVideoDecoder, LTXVideoEncoder, load_vae_decoder, load_vae_encoder
 from ltx_mlx.scheduler import euler_step, get_sigmas
 
 
@@ -55,6 +55,7 @@ class LTXPipeline:
         self.tokenizer: Optional[T5Tokenizer] = None
         self.transformer: Optional[LTXVideoTransformer] = None
         self.vae: Optional[LTXVideoDecoder] = None
+        self.vae_encoder: Optional[LTXVideoEncoder] = None
         self._rope_cache = {}
 
         # Auto-detect checkpoint
@@ -92,7 +93,12 @@ class LTXPipeline:
         print("Loading VAE decoder...")
         t0 = time.time()
         self.vae = load_vae_decoder(self._ckpt, self.dtype)
-        print(f"  VAE: {time.time()-t0:.1f}s")
+        print(f"  VAE decoder: {time.time()-t0:.1f}s")
+
+        print("Loading VAE encoder...")
+        t0 = time.time()
+        self.vae_encoder = load_vae_encoder(self._ckpt, self.dtype)
+        print(f"  VAE encoder: {time.time()-t0:.1f}s")
 
         self._load_latent_stats()
 
@@ -135,6 +141,33 @@ class LTXPipeline:
             )
         return self._rope_cache[key]
 
+    def _encode_image(self, image: np.ndarray, lat_h: int, lat_w: int) -> mx.array:
+        """Encode an image to latent space using the VAE encoder.
+
+        Args:
+            image: (H, W, 3) uint8 numpy array
+            lat_h: Expected latent height
+            lat_w: Expected latent width
+
+        Returns:
+            (1, lat_h * lat_w, 128) normalized latent tokens
+        """
+        # Preprocess: uint8 [0,255] → float [-1, 1], add batch+temporal dims
+        img = image.astype(np.float32) / 255.0 * 2.0 - 1.0
+        img_mx = mx.array(img[None, None, ...]).astype(self.dtype)  # (1, 1, H, W, 3) NDHWC
+
+        # Encode
+        latent = self.vae_encoder(img_mx)  # (1, 1, lat_h, lat_w, 128)
+        mx.eval(latent)
+
+        # Normalize using per-channel stats (same stats used for decoder denormalization)
+        if self.latent_mean is not None:
+            latent = (latent - self.latent_mean[None, None, None, None, :]) / self.latent_std[None, None, None, None, :]
+
+        # Flatten to token form: (1, lat_h * lat_w, 128)
+        latent = latent.reshape(1, lat_h * lat_w, 128)
+        return latent
+
     def generate(
         self,
         prompt: str,
@@ -144,8 +177,9 @@ class LTXPipeline:
         num_steps: Optional[int] = None,
         timesteps: Optional[list[float]] = None,
         seed: int = 42,
+        image: Optional[np.ndarray] = None,
     ) -> np.ndarray:
-        """Generate video frames.
+        """Generate video frames from text, or image+text.
 
         Args:
             prompt: Text description of desired video.
@@ -155,6 +189,8 @@ class LTXPipeline:
             num_steps: Denoising steps. Default: 4 for 2B, 8 for 13B.
             timesteps: Explicit sigma schedule (bypasses dynamic shifting).
             seed: Random seed.
+            image: Optional (H, W, 3) uint8 numpy array for image-to-video.
+                   Image is used as the first frame conditioning.
 
         Returns:
             (num_frames, height, width, 3) uint8 numpy array.
@@ -194,13 +230,44 @@ class LTXPipeline:
             sigmas = get_sigmas(num_steps, seq_len)
             n_steps = num_steps
 
+        # ---- Encode conditioning image (if provided) ----
+        image_latent = None
+        if image is not None:
+            t0_enc = time.time()
+            # Resize/crop image to target resolution
+            from PIL import Image as PILImage
+            pil_img = PILImage.fromarray(image)
+            pil_img = pil_img.resize((width, height), PILImage.LANCZOS)
+            image_resized = np.array(pil_img)
+
+            image_latent = self._encode_image(image_resized, lat_h, lat_w)
+            mx.eval(image_latent)
+            enc_time = time.time() - t0_enc
+            print(f"  Image encode: {enc_time:.2f}s")
+
         # ---- Denoise ----
         print(f"  Denoising: {n_steps} steps...")
         t0 = time.time()
 
         mx.random.seed(seed)
-        latents = mx.random.normal((1, seq_len, 128)).astype(self.dtype)
-        latents = latents * sigmas[0]
+        noise = mx.random.normal((1, seq_len, 128)).astype(self.dtype)
+
+        # Build conditioning mask for image-to-video
+        cond_mask = None
+        if image_latent is not None:
+            frame_size = lat_h * lat_w
+            # Frame 0 = image latent (clean), other frames = noise
+            latents = mx.concatenate([
+                image_latent,
+                noise[:, frame_size:, :] * sigmas[0],
+            ], axis=1)
+            # Conditioning mask: 1.0 for frame 0 (conditioned), 0.0 for rest
+            cond_mask = mx.concatenate([
+                mx.ones((1, frame_size), dtype=self.dtype),
+                mx.zeros((1, seq_len - frame_size), dtype=self.dtype),
+            ], axis=1)
+        else:
+            latents = noise * sigmas[0]
 
         for i in range(n_steps):
             s = float(sigmas[i])
@@ -210,9 +277,18 @@ class LTXPipeline:
             pred = self.transformer(
                 latents, t_val, text_embeds, lat_t, lat_h, lat_w,
                 rope=rope, encoder_attention_mask=attention_mask,
+                conditioning_mask=cond_mask,
             )
 
             latents = euler_step(pred, s, s_next, latents)
+
+            if cond_mask is not None:
+                # Freeze conditioned tokens: replace frame 0 with original image latent
+                latents = mx.concatenate([
+                    image_latent,
+                    latents[:, frame_size:, :],
+                ], axis=1)
+
             mx.eval(latents)
 
         denoise_time = time.time() - t0

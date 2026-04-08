@@ -294,7 +294,20 @@ class LTXVideoTransformer(nn.Module):
                  encoder_hidden_states: mx.array,
                  num_frames: int, height: int, width: int,
                  rope: Optional[Tuple[mx.array, mx.array]] = None,
-                 encoder_attention_mask: Optional[mx.array] = None) -> mx.array:
+                 encoder_attention_mask: Optional[mx.array] = None,
+                 conditioning_mask: Optional[mx.array] = None) -> mx.array:
+        """Forward pass.
+
+        Args:
+            x: (B, L, C) latent tokens
+            t: (B,) timestep values (sigma * 1000)
+            encoder_hidden_states: (B, S, caption_channels) T5 text embeddings
+            num_frames, height, width: latent grid dimensions
+            rope: precomputed (cos, sin) RoPE
+            encoder_attention_mask: (B, S) text attention mask
+            conditioning_mask: (B, L) optional per-token mask. 1.0 = conditioned (timestep→0),
+                0.0 = unconditioned (normal timestep). Used for image-to-video.
+        """
         B, L, C = x.shape
 
         if rope is None:
@@ -302,9 +315,18 @@ class LTXVideoTransformer(nn.Module):
 
         x = self.proj_in(x)
 
-        temb, embedded_t = self.time_embed(t)
-        temb = temb.astype(x.dtype).reshape(B, 1, temb.shape[-1])
-        embedded_t = embedded_t.astype(x.dtype).reshape(B, 1, embedded_t.shape[-1])
+        if conditioning_mask is not None:
+            # Per-token timestep: conditioned tokens get t=0, others get normal t
+            temb_noisy, embedded_t_noisy = self.time_embed(t)
+            temb_clean, embedded_t_clean = self.time_embed(mx.zeros_like(t))
+            # Blend per-token: (B, L, D)
+            m = conditioning_mask[:, :, None].astype(x.dtype)  # (B, L, 1)
+            temb = (temb_clean[:, None, :] * m + temb_noisy[:, None, :] * (1 - m)).astype(x.dtype)
+            embedded_t = (embedded_t_clean[:, None, :] * m + embedded_t_noisy[:, None, :] * (1 - m)).astype(x.dtype)
+        else:
+            temb, embedded_t = self.time_embed(t)
+            temb = temb.astype(x.dtype).reshape(B, 1, temb.shape[-1])
+            embedded_t = embedded_t.astype(x.dtype).reshape(B, 1, embedded_t.shape[-1])
 
         ctx = self.caption_projection(encoder_hidden_states)
         ctx = ctx.reshape(B, -1, self.inner_dim)

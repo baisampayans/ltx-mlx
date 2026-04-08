@@ -1,8 +1,11 @@
 """LTX-Video MLX CLI.
 
 Usage:
-    # 2B model (fast, ~7s at 480p)
+    # 2B model text-to-video (fast, ~7s at 480p)
     ltx-mlx --prompt "a cat sitting on a windowsill, golden hour"
+
+    # Image-to-video
+    ltx-mlx --prompt "the cat turns its head" --image cat.png
 
     # 13B model (sharp, ~60s at 720p)
     ltx-mlx --prompt "a portrait, cinematic 4k" --model 13b --height 720 --width 1280
@@ -37,6 +40,8 @@ Examples:
 
     parser.add_argument("--prompt", type=str, required=True,
                         help="Text description of desired video")
+    parser.add_argument("--image", type=str, default=None,
+                        help="Path to conditioning image for image-to-video")
     parser.add_argument("--model", type=str, default="2b", choices=["2b", "13b"],
                         help="Model size (default: 2b)")
     parser.add_argument("--model-dir", type=str, default="models/LTX",
@@ -73,6 +78,14 @@ Examples:
     if args.model == "13b":
         checkpoint = "LTX 13B/ltxv-13b-0.9.8-distilled.safetensors"
 
+    # Load conditioning image if provided
+    image = None
+    if args.image:
+        from PIL import Image
+        import numpy as np
+        image = np.array(Image.open(args.image).convert("RGB"))
+        print(f"Conditioning image: {args.image} ({image.shape[1]}x{image.shape[0]})")
+
     from ltx_mlx.pipeline import LTXPipeline
 
     pipe = LTXPipeline(args.model_dir, checkpoint=checkpoint)
@@ -84,6 +97,7 @@ Examples:
         width=width,
         num_steps=args.steps,
         seed=args.seed,
+        image=image,
     )
 
     out_path = args.output or f"output_ltx_{height}x{width}.mp4"

@@ -339,6 +339,210 @@ class LTXVideoDecoder(nn.Module):
         return x
 
 
+# ============================================================
+# Encoder building blocks (no timestep conditioning)
+# ============================================================
+
+class EncoderResBlock3d(nn.Module):
+    """Pre-activation ResBlock for encoder (no timestep conditioning).
+
+    Architecture: norm1 → SiLU → conv1 → norm2 → SiLU → conv2 + shortcut.
+    Norms are parameter-free RMSNorm.
+    """
+
+    def __init__(self, channels: int):
+        super().__init__()
+        self.conv1 = CausalConv3d(channels, channels, kernel=3)
+        self.conv2 = CausalConv3d(channels, channels, kernel=3)
+
+    def __call__(self, x):
+        h = _rms_norm(x)
+        h = nn.silu(h)
+        h = self.conv1(h)
+        h = _rms_norm(h)
+        h = nn.silu(h)
+        h = self.conv2(h)
+        return h + x
+
+
+class EncoderResBlockGroup(nn.Module):
+    """Group of encoder ResBlocks (no timestep conditioning)."""
+
+    def __init__(self, channels: int, num_blocks: int):
+        super().__init__()
+        self.res_blocks = [EncoderResBlock3d(channels) for _ in range(num_blocks)]
+
+    def __call__(self, x):
+        for block in self.res_blocks:
+            x = block(x)
+        return x
+
+
+def _rms_norm(x, eps=1e-6):
+    """Parameter-free RMS normalization along last axis."""
+    rms = mx.sqrt(mx.mean(x * x, axis=-1, keepdims=True) + eps)
+    return x / rms
+
+
+class SpaceToDepthDownsample(nn.Module):
+    """Space-to-depth downsampler with residual (Lightricks format).
+
+    Rearranges spatial/temporal dims into channels, with a conv path + group-averaged residual.
+    MLX uses NDHWC format.
+    """
+
+    def __init__(self, in_ch: int, out_ch: int, stride: tuple):
+        super().__init__()
+        self.stride = stride
+        s_prod = stride[0] * stride[1] * stride[2]
+        self.group_size = in_ch * s_prod // out_ch
+        conv_out_ch = out_ch // s_prod
+        self.conv = CausalConv3d(in_ch, conv_out_ch, kernel=3)
+
+    def _space_to_depth(self, x):
+        """Rearrange spatial dims into channels: (B,D,H,W,C) → (B,D/s0,H/s1,W/s2,C*s0*s1*s2)."""
+        B, D, H, W, C = x.shape
+        s0, s1, s2 = self.stride
+        x = x.reshape(B, D // s0, s0, H // s1, s1, W // s2, s2, C)
+        x = mx.transpose(x, axes=(0, 1, 3, 5, 7, 2, 4, 6))
+        x = x.reshape(B, D // s0, H // s1, W // s2, C * s0 * s1 * s2)
+        return x
+
+    def __call__(self, x):
+        # Causal temporal padding: duplicate first frame
+        if self.stride[0] == 2:
+            x = mx.concatenate([x[:, :1], x], axis=1)
+
+        # Residual: space-to-depth + group average
+        x_in = self._space_to_depth(x)
+        B, D2, H2, W2, C2 = x_in.shape
+        x_in = x_in.reshape(B, D2, H2, W2, -1, self.group_size)
+        x_in = mx.mean(x_in, axis=-1)
+
+        # Conv path + space-to-depth
+        h = self.conv(x)
+        h = self._space_to_depth(h)
+
+        return h + x_in
+
+
+# ============================================================
+# Full Encoder
+# ============================================================
+
+class LTXVideoEncoder(nn.Module):
+    """LTX-Video VAE Encoder (Lightricks original format).
+
+    Architecture (from combined checkpoint):
+        Patchify: (B, D, H, W, 3) → (B, D, H/4, W/4, 48)
+        conv_in: 48 → 128
+        down_blocks:
+            0: 4 ResBlocks at 128
+            1: SpaceToDepthDownsample 128→256, stride=(1,2,2)
+            2: 6 ResBlocks at 256
+            3: SpaceToDepthDownsample 256→512, stride=(2,1,1)
+            4: 6 ResBlocks at 512
+            5: SpaceToDepthDownsample 512→1024, stride=(2,2,2)
+            6: 2 ResBlocks at 1024
+            7: SpaceToDepthDownsample 1024→2048, stride=(2,2,2)
+            8: 2 ResBlocks at 2048
+        norm_out: RMSNorm (parameter-free)
+        SiLU
+        conv_out: 2048 → 129
+        Last-channel trick → 256 channels (128 mean + 128 logvar)
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.patch_size = 4
+        self.patch_size_t = 1
+
+        self.conv_in = CausalConv3d(48, 128, kernel=3)
+
+        self.down_blocks = []
+        # Block 0: 4 ResBlocks at 128
+        self.down_blocks.append(EncoderResBlockGroup(128, 4))
+        # Block 1: SpaceToDepth 128→256, stride=(1,2,2)
+        self.down_blocks.append(SpaceToDepthDownsample(128, 256, stride=(1, 2, 2)))
+        # Block 2: 6 ResBlocks at 256
+        self.down_blocks.append(EncoderResBlockGroup(256, 6))
+        # Block 3: SpaceToDepth 256→512, stride=(2,1,1)
+        self.down_blocks.append(SpaceToDepthDownsample(256, 512, stride=(2, 1, 1)))
+        # Block 4: 6 ResBlocks at 512
+        self.down_blocks.append(EncoderResBlockGroup(512, 6))
+        # Block 5: SpaceToDepth 512→1024, stride=(2,2,2)
+        self.down_blocks.append(SpaceToDepthDownsample(512, 1024, stride=(2, 2, 2)))
+        # Block 6: 2 ResBlocks at 1024
+        self.down_blocks.append(EncoderResBlockGroup(1024, 2))
+        # Block 7: SpaceToDepth 1024→2048, stride=(2,2,2)
+        self.down_blocks.append(SpaceToDepthDownsample(1024, 2048, stride=(2, 2, 2)))
+        # Block 8: 2 ResBlocks at 2048
+        self.down_blocks.append(EncoderResBlockGroup(2048, 2))
+
+        self.conv_out = CausalConv3d(2048, 129, kernel=3)
+
+    def _patchify(self, x):
+        """Patchify input: (B, D, H, W, 3) → (B, D, H/4, W/4, 48)."""
+        B, D, H, W, C = x.shape
+        p = self.patch_size
+        p_t = self.patch_size_t
+        x = x.reshape(B, D // p_t, p_t, H // p, p, W // p, p, C)
+        x = mx.transpose(x, axes=(0, 1, 3, 5, 7, 2, 6, 4))
+        x = x.reshape(B, D // p_t, H // p, W // p, C * p_t * p * p)
+        return x
+
+    def __call__(self, x):
+        """Encode input to latent.
+
+        Args:
+            x: (B, D, H, W, 3) NDHWC input in [-1, 1]
+
+        Returns:
+            (B, D_lat, H_lat, W_lat, 128) latent mean
+        """
+        x = self._patchify(x)
+        x = self.conv_in(x)
+
+        for block in self.down_blocks:
+            x = block(x)
+
+        x = _rms_norm(x)
+        x = nn.silu(x)
+        x = self.conv_out(x)
+
+        # Last-channel trick: output is 129 channels
+        # Channel 129 becomes the logvar (repeated for all 128 latent channels)
+        # We only need the mean (first 128 channels) for image conditioning
+        mean = x[..., :128]
+        return mean
+
+
+def load_vae_encoder(ckpt_path: str, dtype: mx.Dtype = mx.bfloat16) -> LTXVideoEncoder:
+    """Load LTX VAE encoder from combined safetensors checkpoint."""
+    encoder = LTXVideoEncoder()
+
+    raw = mx.load(ckpt_path)
+
+    mapped = {}
+    for k, v in raw.items():
+        if not k.startswith("vae.encoder."):
+            continue
+        key = k[len("vae.encoder."):]
+
+        # Transpose conv3d: PyTorch (C_out, C_in, D, H, W) -> MLX (C_out, D, H, W, C_in)
+        if key.endswith(".conv.weight") and v.ndim == 5:
+            v = mx.transpose(v, axes=(0, 2, 3, 4, 1))
+
+        mapped[key] = v.astype(dtype)
+
+    encoder.load_weights(list(mapped.items()))
+
+    import mlx.utils
+    n_params = sum(v.size for _, v in mlx.utils.tree_flatten(encoder.parameters()))
+    print(f"  VAE encoder loaded: {n_params/1e6:.0f}M params, {dtype}")
+    return encoder
+
+
 def load_vae_decoder(ckpt_path: str, dtype: mx.Dtype = mx.bfloat16) -> LTXVideoDecoder:
     """Load official LTX VAE decoder from combined safetensors checkpoint.
 
