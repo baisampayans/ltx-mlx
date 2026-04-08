@@ -234,26 +234,18 @@ class LTXPipeline:
         image_latent = None
         if image is not None:
             t0_enc = time.time()
-            # Resize to fit + extend edges for padding areas
-            from PIL import Image as PILImage, ImageFilter
+            from PIL import Image as PILImage
             pil_img = PILImage.fromarray(image)
             src_w, src_h = pil_img.size
-            scale = min(width / src_w, height / src_h)
+            # Resize to cover target dims (preserve AR), then center-crop
+            scale = max(width / src_w, height / src_h)
             new_w = round(src_w * scale)
             new_h = round(src_h * scale)
-            fitted = pil_img.resize((new_w, new_h), PILImage.LANCZOS)
-            pad_left = (width - new_w) // 2
-            pad_top = (height - new_h) // 2
-
-            if pad_left == 0 and pad_top == 0:
-                image_resized = np.array(fitted)
-            else:
-                # Extreme blur preserves only colors (no shapes/streaks)
-                bg = pil_img.resize((width, height), PILImage.LANCZOS)
-                for _ in range(3):
-                    bg = bg.filter(ImageFilter.GaussianBlur(radius=50))
-                bg.paste(fitted, (pad_left, pad_top))
-                image_resized = np.array(bg)
+            pil_img = pil_img.resize((new_w, new_h), PILImage.LANCZOS)
+            left = (new_w - width) // 2
+            top = (new_h - height) // 2
+            pil_img = pil_img.crop((left, top, left + width, top + height))
+            image_resized = np.array(pil_img)
 
             image_latent = self._encode_image(image_resized, lat_h, lat_w)
             mx.eval(image_latent)
