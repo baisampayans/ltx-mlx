@@ -237,15 +237,39 @@ class LTXPipeline:
             from PIL import Image as PILImage
             pil_img = PILImage.fromarray(image)
             src_w, src_h = pil_img.size
-            # Resize to cover target dims (preserve AR), then center-crop
-            scale = max(width / src_w, height / src_h)
+            # Fit image inside target (preserve AR, no clipping)
+            scale = min(width / src_w, height / src_h)
             new_w = round(src_w * scale)
             new_h = round(src_h * scale)
-            pil_img = pil_img.resize((new_w, new_h), PILImage.LANCZOS)
-            left = (new_w - width) // 2
-            top = (new_h - height) // 2
-            pil_img = pil_img.crop((left, top, left + width, top + height))
-            image_resized = np.array(pil_img)
+            fitted = pil_img.resize((new_w, new_h), PILImage.LANCZOS)
+            pad_left = (width - new_w) // 2
+            pad_top = (height - new_h) // 2
+
+            from PIL import ImageFilter
+            if pad_left == 0 and pad_top == 0:
+                image_resized = np.array(fitted)
+                _frame0_spatial_mask = None
+            else:
+                # Edge-extend + heavy blur for color-matched padding
+                fitted_arr = np.array(fitted)
+                pad_bottom = height - new_h - pad_top
+                pad_right_px = width - new_w - pad_left
+                extended = np.pad(fitted_arr,
+                    ((pad_top, pad_bottom), (pad_left, pad_right_px), (0, 0)),
+                    mode='edge')
+                bg = PILImage.fromarray(extended)
+                for _ in range(5):
+                    bg = bg.filter(ImageFilter.GaussianBlur(radius=40))
+                bg.paste(fitted, (pad_left, pad_top))
+                image_resized = np.array(bg)
+                # Spatial mask: 1.0 for image, 0.8 for padding (soft-frozen)
+                _pl = pad_left // self.VAE_SPATIAL_COMPRESSION
+                _pt = pad_top // self.VAE_SPATIAL_COMPRESSION
+                _iw = new_w // self.VAE_SPATIAL_COMPRESSION
+                _ih = new_h // self.VAE_SPATIAL_COMPRESSION
+                spatial_mask = np.full((lat_h, lat_w), 0.8, dtype=np.float32)
+                spatial_mask[_pt:_pt+_ih, _pl:_pl+_iw] = 1.0
+                _frame0_spatial_mask = spatial_mask.reshape(-1)
 
             image_latent = self._encode_image(image_resized, lat_h, lat_w)
             mx.eval(image_latent)
@@ -263,16 +287,23 @@ class LTXPipeline:
         cond_mask = None
         if image_latent is not None:
             frame_size = lat_h * lat_w
-            # Frame 0 = full image latent (including blurred padding), other frames = noise
-            latents = mx.concatenate([
-                image_latent,
-                noise[:, frame_size:, :] * sigmas[0],
-            ], axis=1)
-            # Freeze all of frame 0 (image + blurred background)
-            cond_mask = mx.concatenate([
-                mx.ones((1, frame_size), dtype=self.dtype),
-                mx.zeros((1, seq_len - frame_size), dtype=self.dtype),
-            ], axis=1)
+
+            if _frame0_spatial_mask is not None:
+                # Selective: image=frozen(1.0), padding=soft-frozen(0.8)
+                frame0_mask = mx.array(_frame0_spatial_mask[None, :]).astype(self.dtype)
+                # Frame 0 starts as the encoded canvas (image + blurred padding)
+                latents = mx.concatenate([image_latent, noise[:, frame_size:, :] * sigmas[0]], axis=1)
+                cond_mask = mx.concatenate([
+                    frame0_mask,
+                    mx.zeros((1, seq_len - frame_size), dtype=self.dtype),
+                ], axis=1)
+            else:
+                # No padding — freeze all of frame 0
+                latents = mx.concatenate([image_latent, noise[:, frame_size:, :] * sigmas[0]], axis=1)
+                cond_mask = mx.concatenate([
+                    mx.ones((1, frame_size), dtype=self.dtype),
+                    mx.zeros((1, seq_len - frame_size), dtype=self.dtype),
+                ], axis=1)
         else:
             latents = noise * sigmas[0]
 
@@ -290,11 +321,13 @@ class LTXPipeline:
             latents = euler_step(pred, s, s_next, latents)
 
             if cond_mask is not None:
-                # Freeze all of frame 0
-                latents = mx.concatenate([
-                    image_latent,
-                    latents[:, frame_size:, :],
-                ], axis=1)
+                # Freeze frame 0: image tokens fully, padding tokens mostly
+                # For mask=1.0 (image): 100% original, 0% model
+                # For mask=0.8 (padding): 80% original blurred bg, 20% model refinement
+                frame0_current = latents[:, :frame_size, :]
+                m = frame0_mask[:, :, None] if _frame0_spatial_mask is not None else 1.0
+                frame0_frozen = image_latent * m + frame0_current * (1 - m)
+                latents = mx.concatenate([frame0_frozen, latents[:, frame_size:, :]], axis=1)
 
             mx.eval(latents)
 
