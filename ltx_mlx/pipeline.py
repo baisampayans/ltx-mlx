@@ -234,20 +234,23 @@ class LTXPipeline:
         image_latent = None
         if image is not None:
             t0_enc = time.time()
-            # Resize + center-crop to target resolution (preserves aspect ratio)
-            from PIL import Image as PILImage
+            # Resize to fit + blurred background padding to preserve full composition
+            from PIL import Image as PILImage, ImageFilter
             pil_img = PILImage.fromarray(image)
             src_w, src_h = pil_img.size
-            # Scale so the shorter side covers the target, then center-crop
-            scale = max(width / src_w, height / src_h)
+            # Scale to fit inside target (preserve aspect ratio, no clipping)
+            scale = min(width / src_w, height / src_h)
             new_w = round(src_w * scale)
             new_h = round(src_h * scale)
-            pil_img = pil_img.resize((new_w, new_h), PILImage.LANCZOS)
-            # Center crop
-            left = (new_w - width) // 2
-            top = (new_h - height) // 2
-            pil_img = pil_img.crop((left, top, left + width, top + height))
-            image_resized = np.array(pil_img)
+            fitted = pil_img.resize((new_w, new_h), PILImage.LANCZOS)
+            # Background: stretched + heavily blurred version for natural padding
+            bg = pil_img.resize((width, height), PILImage.LANCZOS)
+            bg = bg.filter(ImageFilter.GaussianBlur(radius=30))
+            # Paste fitted image centered on blurred background
+            pad_left = (width - new_w) // 2
+            pad_top = (height - new_h) // 2
+            bg.paste(fitted, (pad_left, pad_top))
+            image_resized = np.array(bg)
 
             image_latent = self._encode_image(image_resized, lat_h, lat_w)
             mx.eval(image_latent)
