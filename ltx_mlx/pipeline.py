@@ -234,10 +234,19 @@ class LTXPipeline:
         image_latent = None
         if image is not None:
             t0_enc = time.time()
-            # Resize/crop image to target resolution
+            # Resize + center-crop to target resolution (preserves aspect ratio)
             from PIL import Image as PILImage
             pil_img = PILImage.fromarray(image)
-            pil_img = pil_img.resize((width, height), PILImage.LANCZOS)
+            src_w, src_h = pil_img.size
+            # Scale so the shorter side covers the target, then center-crop
+            scale = max(width / src_w, height / src_h)
+            new_w = round(src_w * scale)
+            new_h = round(src_h * scale)
+            pil_img = pil_img.resize((new_w, new_h), PILImage.LANCZOS)
+            # Center crop
+            left = (new_w - width) // 2
+            top = (new_h - height) // 2
+            pil_img = pil_img.crop((left, top, left + width, top + height))
             image_resized = np.array(pil_img)
 
             image_latent = self._encode_image(image_resized, lat_h, lat_w)
